@@ -9,10 +9,10 @@ import boto3
 import os
 import io
 import hashlib
+import random
 
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
-
 
 # ---------------- ENV ----------------
 
@@ -26,7 +26,6 @@ AWS_BUCKET = os.getenv("AWS_BUCKET_NAME")
 JWT_SECRET = os.getenv("JWT_SECRET", "supersecretkey")
 ALGORITHM = "HS256"
 
-
 # ---------------- AWS ----------------
 
 s3 = boto3.client(
@@ -36,11 +35,9 @@ s3 = boto3.client(
     region_name=AWS_REGION,
 )
 
-
 # ---------------- APP ----------------
 
 app = FastAPI()
-
 
 # ---------------- DB ----------------
 
@@ -48,7 +45,6 @@ from app.database import SessionLocal, engine, Base
 from app.models import User
 
 Base.metadata.create_all(bind=engine)
-
 
 # ---------------- DEP ----------------
 
@@ -58,7 +54,6 @@ def get_db():
         yield db
     finally:
         db.close()
-
 
 # ---------------- SECURITY ----------------
 
@@ -74,6 +69,62 @@ from app.security.storage_manager import (
     log_rotation
 )
 
+# ---------------- PHASE 7: ENTROPY ENGINE ----------------
+
+import math
+from collections import Counter
+
+SECURITY_EVENTS = []
+MAX_EVENTS = 100
+ENTROPY_THRESHOLD = 1.5
+BASE_FAILED_LIMIT = 5
+
+
+def log_entropy_event(event: str):
+
+    global SECURITY_EVENTS
+
+    SECURITY_EVENTS.append({
+        "type": event,
+        "time": datetime.utcnow()
+    })
+
+    if len(SECURITY_EVENTS) > MAX_EVENTS:
+        SECURITY_EVENTS.pop(0)
+
+
+def calculate_entropy():
+
+    if len(SECURITY_EVENTS) < 10:
+        return 3.0
+
+    types = [e["type"] for e in SECURITY_EVENTS]
+    counts = Counter(types)
+
+    total = len(types)
+    entropy = 0.0
+
+    for c in counts.values():
+        p = c / total
+        entropy -= p * math.log2(p)
+
+    return entropy
+
+
+def is_system_predictable():
+
+    entropy = calculate_entropy()
+
+    print("[ENTROPY]", entropy)
+
+    return entropy < ENTROPY_THRESHOLD
+
+
+def randomize_threshold(base: int):
+
+    jitter = random.randint(-2, 2)
+
+    return max(3, base + jitter)
 
 # ---------------- AUTH ----------------
 
@@ -86,6 +137,7 @@ def get_current_user(
 ):
 
     try:
+
         payload = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM])
 
         email = payload.get("sub")
@@ -99,7 +151,6 @@ def get_current_user(
         if not user:
             raise HTTPException(401)
 
-        # Token invalidation
         if ver != user.token_version:
             raise HTTPException(401, "Token expired")
 
@@ -138,14 +189,11 @@ def log_event(user, action, filename):
 
 def self_heal(user: User, db: Session):
 
-    # Invalidate tokens
     user.token_version += 1
-
-    # Reset trust
     user.trust_score = 50
-
-    # Lock account
     user.locked_until = datetime.utcnow() + timedelta(minutes=5)
+
+    log_entropy_event("LOCK")
 
     with open("audit.log", "a") as f:
         f.write(
@@ -153,8 +201,6 @@ def self_heal(user: User, db: Session):
         )
 
     db.commit()
-
-    # ---------- ROTATE ALL FILES TO GLACIER ----------
 
     prefix = f"{user.email}/"
 
@@ -176,8 +222,10 @@ def self_heal(user: User, db: Session):
                 log_rotation(
                     user.email,
                     key,
-                    "GLACIER"
+                    "STANDARD_IA"
                 )
+
+                log_entropy_event("ROTATE")
 
 
 # ---------------- RECOVER STORAGE ----------------
@@ -207,6 +255,8 @@ def recover_storage(user_email: str):
                 key,
                 "STANDARD"
             )
+
+            log_entropy_event("RECOVERY")
 
 
 # ---------------- HOME ----------------
@@ -279,23 +329,27 @@ def login(
 
         user.failed_attempts += 1
 
-        # Lock after 5 fails
-        if user.failed_attempts >= 5:
+        limit = BASE_FAILED_LIMIT
+
+        if is_system_predictable():
+            limit = randomize_threshold(BASE_FAILED_LIMIT)
+
+        if user.failed_attempts >= limit:
+
             user.locked_until = now + timedelta(minutes=5)
+
             self_heal(user, db)
 
         db.commit()
 
         raise HTTPException(400, "Invalid login")
 
-    # Reset on success
+    # Reset
     user.failed_attempts = 0
     user.locked_until = None
 
-    # Recover storage if healed
     recover_storage(user.email)
 
-    # Risk
     risk = calculate_risk(
         user=user,
         ip_address=ip,
@@ -303,7 +357,6 @@ def login(
         action="login"
     )
 
-    # Self-heal on high risk
     if risk == "HIGH":
         self_heal(user, db)
 
@@ -355,7 +408,6 @@ async def upload_file(
 
     ext = file.filename.split(".")[-1].lower()
 
-    # Risk
     risk = calculate_risk(
         user=db_user,
         ip_address=ip,
@@ -365,14 +417,12 @@ async def upload_file(
         file_type=ext
     )
 
-    # Encrypt
     encrypted_data, key = encrypt_data(
         data=data,
         password=user,
         level=risk
     )
 
-    # Split parts
     if risk == "LOW":
         parts = 2
     elif risk == "MEDIUM":
@@ -388,7 +438,6 @@ async def upload_file(
         threshold=(parts // 2) + 1
     )
 
-    # Store key parts
     for i, share in enumerate(shares):
 
         s3.put_object(
@@ -397,10 +446,8 @@ async def upload_file(
             Body=share
         )
 
-    # Storage tier
     storage_class = get_storage_class(risk)
 
-    # Store file
     enc_key = f"{user}/{file.filename}.enc"
 
     s3.put_object(
@@ -411,6 +458,8 @@ async def upload_file(
     )
 
     log_rotation(user, file.filename, storage_class)
+
+    log_entropy_event("ROTATE")
 
     log_event(user, f"UPLOAD-{risk}", enc_key)
 
@@ -434,7 +483,6 @@ def download_file(
 
     try:
 
-        # Get file
         obj = s3.get_object(
             Bucket=AWS_BUCKET,
             Key=enc_key
@@ -442,7 +490,6 @@ def download_file(
 
         encrypted_data = obj["Body"].read()
 
-        # Get key parts
         shares = []
 
         i = 0
@@ -475,7 +522,6 @@ def download_file(
 
         rebuild_key(shares)
 
-        # Decrypt
         original = decrypt_data(
             encrypted_data,
             password=user,
