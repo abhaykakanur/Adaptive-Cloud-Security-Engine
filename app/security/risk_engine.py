@@ -55,7 +55,7 @@ def calculate_risk(
 
     # ---------------- CLASSIFICATION ----------------
     if score <= 2:
-        return "LOW"
+        return "MEDIUM"
 
     elif score <= 5:
         return "MEDIUM"
